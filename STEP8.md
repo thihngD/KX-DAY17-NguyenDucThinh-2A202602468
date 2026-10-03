@@ -159,7 +159,58 @@ Mã nguồn: `src/memory_store.py` (`extract_profile_candidates`, `extract_profi
 4. **Compact kéo chi phí ngữ cảnh xuống:** Advanced còn 7976 token (−62%) với 7 compaction. `Agent tokens only` không giảm (224 so với 180). Ở hội thoại ngắn, compact không kích hoạt và Advanced tốn gấp 1.86 lần.
 5. **Hệ thống mạnh hơn nhưng phức tạp hơn và cần guardrail:** cần guard câu hỏi, phủ định, threshold. Mỗi guardrail có cái giá riêng (false negative ở conv-08, list style phình 7 mục, summary làm mất chi tiết tin tức).
 
-## Phạm vi đã kiểm chứng
+## Phụ lục: kết quả chế độ live (`gpt-4o-mini`)
 
-- Toàn bộ số liệu trên là chế độ **offline**.
-- Chế độ live (`python src/benchmark.py --live`, dùng provider trong `.env`) đã được viết. Mình đã kiểm tra phần khởi tạo với API key giả: `create_agent` dựng được graph cho cả hai agent, và `build_chat_model` tạo đúng class cho openai/anthropic/gemini/openrouter/ollama. Tuy nhiên mình **chưa gọi LLM thật** trong lần đo này, nên không có số liệu live.
+Toàn bộ phân tích ở trên dùng số liệu **offline**: tất định, chạy lại cho đúng cùng một số.
+
+Phần này là kết quả của lệnh `python src/benchmark.py --live`:
+- Model: `gpt-4o-mini` qua OpenAI, `temperature=0`. Ngưỡng compact và confidence giữ nguyên như bản offline.
+- Cách đếm token: lấy `usage_metadata` thật do API trả về (`input_tokens` / `output_tokens`), không dùng `len // 4`.
+- Mỗi cấu hình chỉ chạy **một lần**. LLM không tất định nên chạy lại có thể ra số khác.
+
+### Standard Benchmark (live)
+
+| Agent    | Agent tokens only | Prompt tokens processed | Cross-session recall | Response quality | Memory growth (bytes) | Compactions |
+|----------|------------------:|------------------------:|---------------------:|-----------------:|----------------------:|------------:|
+| Baseline |              7313 |                   48540 |                 0.07 |             0.23 |                     0 |           0 |
+| Advanced |              7474 |                  116034 |                 0.96 |             0.97 |                   687 |           2 |
+
+### Long-Context Stress Benchmark (live)
+
+| Agent    | Agent tokens only | Prompt tokens processed | Cross-session recall | Response quality | Memory growth (bytes) | Compactions |
+|----------|------------------:|------------------------:|---------------------:|-----------------:|----------------------:|------------:|
+| Baseline |              3960 |                   51225 |                    0 |             0.19 |                     0 |           0 |
+| Advanced |              3788 |                   33212 |                    1 |             1    |                   604 |          27 |
+
+### Số live có giữ được kết luận của bản offline không
+
+- **Câu 1 (recall):** có. Recall của Advanced là 0.96 và 1.00, của Baseline là 0.07 và 0.
+  - Baseline có 0.07 vì ở conv-05 và conv-09 model lặp lại chữ "DũngCT" có sẵn trong câu hỏi, ví dụ: "Chưa có thông tin về DũngCT trong cuộc trò chuyện này."
+  - Đây là hạn chế của cách chấm `recall_points` bằng so khớp chuỗi, không phải Baseline nhớ được.
+- **Câu 2 (hội thoại ngắn):** có, và chênh lệch còn rõ hơn. Prompt tokens của Advanced là 116034, của Baseline là 48540, tức gấp khoảng **2.4 lần** (offline là 1.86 lần).
+  - Live đắt hơn vì system prompt của Advanced ngoài `User.md` còn có hướng dẫn và mô tả của 2 tool.
+  - Ngoài ra, mỗi lần model gọi tool là thêm một lượt gọi model, và lượt đó phải gửi lại toàn bộ ngữ cảnh.
+- **Câu 3 (hội thoại dài):** có. Prompt tokens của Advanced là 33212, của Baseline là 51225, tức giảm khoảng **35%** (offline là 62%), với 27 lần compaction.
+  - Mức giảm nhỏ hơn offline vì câu trả lời thật của LLM dài hơn nhiều so với "Đã ghi nhận.". Các câu trả lời này cũng nằm trong 4 message được giữ lại, nên compact phải chạy liên tục (27 lần so với 7 lần offline).
+  - `Agent tokens only` gần như không đổi: 3788 so với 3960. Kết luận "compact tối ưu prompt, không tối ưu output" vẫn đúng.
+- **Câu 4 (memory growth):** live phình gần gấp đôi offline: **687** so với 370 byte, và **604** so với 273 byte.
+  - Toàn bộ phần tăng thêm đến từ tool `save_user_fact`. LLM ghi các "mối quan tâm" như "memory file tăng trưởng theo thời gian" hay "within-session memory", là chủ đề hội thoại chứ không phải sở thích ổn định.
+  - Các mục này vẫn qua được guardrail vì mỗi mục ≤ 40 ký tự.
+  - Hậu quả đo được: câu recall duy nhất Advanced trả lời thiếu ở bản live (conv-09, recall 0.5) là do model lấy hai mục rác này làm "hai mối quan tâm kỹ thuật chính" thay vì Python và AI.
+  - Đây đúng là rủi ro "lưu sai fact" của câu 4, và nó xuất hiện khi giao quyền ghi memory cho LLM.
+
+### Lỗi mà chỉ chế độ live mới phát hiện ra (đã sửa trước khi đo các số trên)
+
+Lần chạy live đầu tiên cho recall Standard của Advanced chỉ **0.89**, và `User.md` của user `dungct` chỉ còn **62 byte**: mất header, mất các fact nghề nghiệp, món ăn và thú cưng.
+
+**Nguyên nhân 1 — ghi đồng thời.** LangGraph chạy các tool call song song trong nhiều thread, nên các lời gọi `save_user_fact` cùng đọc-sửa-ghi một file.
+- Cách sửa: thêm `RLock` cho `UserProfileStore` và ghi file atomic (ghi vào file tạm rồi `os.replace`).
+- Test `test_user_markdown_read_write_edit` có thêm kịch bản 8 thread ghi cùng lúc. Khi tắt lock, kịch bản này fail **20/20** lần thử.
+
+**Nguyên nhân 2 — LLM ghi đè fact đúng bằng giá trị kém hơn.** Ví dụ "cà phê sữa đá" bị ghi đè thành "cà phê", làm sai câu recall ở conv-08. LLM cũng nhồi nguyên câu vào `interests`, khiến file stress phình lên 1658 byte.
+- Cách sửa:
+  - Tool chỉ được điền field còn trống (`overwrite_scalars=False`). Việc đính chính vẫn do bộ xử lý conflict dựa trên luật đảm nhận.
+  - Mỗi mục trong list tối đa 40 ký tự, mỗi list tối đa 8 mục (giữ các mục mới nhất).
+- Sau khi sửa, recall Standard tăng 0.89 → 0.96 và file stress giảm 1658 → 604 byte.
+
+**Bài học:** giao quyền ghi memory cho LLM làm tăng độ linh hoạt nhưng cần thêm guardrail. Kể cả khi đã có guardrail, LLM vẫn lưu "chủ đề đang bàn" thành "sở thích" (xem câu 4 ở trên). Hướng khắc phục tiếp theo có thể là confidence threshold áp dụng riêng cho các lần ghi qua tool, hoặc memory decay cho field list.
